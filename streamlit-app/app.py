@@ -23,8 +23,8 @@ import matplotlib.colors as mcolors
 import matplotlib.cm as cm
 from scipy import stats
 
-st.set_page_config(page_title="Chicago TIF vs. Income", page_icon="🏙️", layout="wide")
-st.title("🏙️ Chicago TIF Spending vs. Community Income")
+st.set_page_config(page_title="Chicago TIF vs. Income", layout="wide")
+st.title("Chicago TIF Spending vs. Community Income")
 
 TIF_ANNUAL  = "data/raw-data/Tax_Increment_Financing_(TIF)_Annual_Report_-_Analysis_of_Special_Tax_Allocation_Fund_20260301.csv"
 TIF_BOUNDS  = "data/raw-data/Boundaries_-_Tax_Increment_Financing_Districts_20260301.csv"
@@ -112,10 +112,10 @@ tif_income_lookup = joined[["TIF District", "weighted_income", "Community Area"]
 
 # ── Tabs ───────────────────────────────────────────────────────────────────────
 tab1, tab2, tab3, tab4 = st.tabs([
-    "🗺️ Income Map",
-    "🗺️ Expenditure Map",
-    "📊 Expenditure by Quintile",
-    "📈 Income vs. TIF Spending",
+    "Income Map",
+    "TIF Expenditure Map",
+    "TIF Expenditure by Income Quintile",
+    "Income vs. TIF Spending",
 ])
 
 # ══════════════════════════════════════════════════════════════════════════════
