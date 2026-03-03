@@ -1,15 +1,3 @@
-"""
-app.py
-
-Interactive dashboard: Chicago TIF expenditures vs. community area income.
-
-Run locally (from repo root):
-    streamlit run streamlit-app/app.py
-
-Deploy: Streamlit Community Cloud — point to streamlit-app/app.py.
-Note: Streamlit apps need to be "woken up" if they have not been run in the
-last 24 hours. This is normal behaviour, not a bug.
-"""
 
 import streamlit as st
 import geopandas as gpd
@@ -28,6 +16,7 @@ st.title("Chicago TIF Spending vs. Community Income")
 
 TIF_ANNUAL  = "data/raw-data/Tax_Increment_Financing_(TIF)_Annual_Report_-_Analysis_of_Special_Tax_Allocation_Fund_20260301.csv"
 TIF_BOUNDS  = "data/raw-data/Boundaries_-_Tax_Increment_Financing_Districts_20260301.csv"
+TIF_DEP     = "data/raw-data/Boundaries_-_Tax_Increment_Financing_Districts_(Deprecated_March_2018)_20260301.csv"
 COMM_BOUNDS = "data/raw-data/Boundaries_-_Community_Areas_20260301.csv"
 ACS_INCOME  = "data/raw-data/ACS_5_Year_Data_by_Community_Area_20260301.csv"
 
@@ -45,14 +34,37 @@ def load_all():
     tif_raw["Total Expenditure"] = clean_dollars(tif_raw["Total Expenditure"])
     tif_raw["Report Year"] = pd.to_numeric(tif_raw["Report Year"], errors="coerce")
 
-    tif_b = pd.read_csv(TIF_BOUNDS)
+    import re as _re
+    def _norm(s): return _re.sub(r"T-\s*0*", "T-", str(s).strip())
+
+    # Combine current + deprecated boundaries so all districts have geometry
+    b1 = pd.read_csv(TIF_BOUNDS); b1.columns = b1.columns.str.strip(); b1["tif_id"] = b1["REF"].apply(_norm)
+    b2 = pd.read_csv(TIF_DEP);   b2.columns = b2.columns.str.strip(); b2["tif_id"] = b2["REF"].apply(_norm)
+    tif_b = pd.concat([b1[["NAME","tif_id","the_geom"]], b2[["NAME","tif_id","the_geom"]]]).drop_duplicates("tif_id")
     tif_b["geometry"] = tif_b["the_geom"].apply(wkt.loads)
     tif_geo = gpd.GeoDataFrame(tif_b, geometry="geometry", crs="EPSG:4326")
     tif_geo = tif_geo.rename(columns={"NAME": "TIF District"})
-    tif_cumulative = tif_raw.groupby("TIF District", as_index=False).agg(
-        cumulative_expenditures=("Total Expenditure", "sum")
+
+    tif_raw["tif_id"] = tif_raw["TIF Number"].apply(_norm)
+    tif_raw["Property Tax Increment - Cumulative"] = clean_dollars(
+        tif_raw["Property Tax Increment - Cumulative"]
     )
-    tif_full = tif_geo.merge(tif_cumulative, on="TIF District", how="left")
+    # Use the last reported cumulative increment per district (avoids summing negative adjustments)
+    inc_last = (
+        tif_raw.dropna(subset=["Property Tax Increment - Cumulative"])
+        .sort_values("Report Year")
+        .groupby("tif_id", as_index=False)["Property Tax Increment - Cumulative"]
+        .last()
+        .rename(columns={"Property Tax Increment - Cumulative": "cumulative_increment"})
+    )
+    tif_cumulative = tif_raw.groupby("tif_id", as_index=False).agg(
+        cumulative_expenditures=("Total Expenditure", "sum"),
+    ).merge(inc_last, on="tif_id", how="left")
+    # Normalised ratio: cumulative expenditure per $1 of tax increment generated
+    tif_cumulative["exp_per_increment"] = (
+        tif_cumulative["cumulative_expenditures"] / tif_cumulative["cumulative_increment"]
+    ).replace([float("inf"), float("-inf")], float("nan"))
+    tif_full = tif_geo.merge(tif_cumulative, on="tif_id", how="left")
 
     comm_b = pd.read_csv(COMM_BOUNDS)
     comm_b["geometry"] = comm_b["the_geom"].apply(wkt.loads)
@@ -80,7 +92,7 @@ def load_all():
     tif_c = tif_full.copy()
     tif_c["geometry"] = tif_full.geometry.centroid
     joined = gpd.sjoin(
-        tif_c[["TIF District", "cumulative_expenditures", "geometry"]],
+        tif_c[["tif_id", "TIF District", "cumulative_expenditures", "exp_per_increment", "geometry"]],
         comm[["Community Area", "weighted_income", "geometry"]],
         how="left", predicate="within",
     ).dropna(subset=["weighted_income", "cumulative_expenditures"])
@@ -88,9 +100,23 @@ def load_all():
         joined["weighted_income"], q=5,
         labels=["Q1\n(Lowest)", "Q2", "Q3", "Q4", "Q5\n(Highest)"]
     )
-    return tif_raw, tif_full, comm, joined
+    # Precompute income-group trend data
+    income_lookup = joined[["tif_id","weighted_income"]].drop_duplicates("tif_id")
+    tif_raw_income = tif_raw.merge(income_lookup, on="tif_id", how="inner")
+    tif_raw_income = tif_raw_income.dropna(subset=["weighted_income","Total Expenditure","Report Year"])
+    breaks = tif_raw_income["weighted_income"].quantile([0, 1/3, 2/3, 1]).values
+    tif_raw_income["income_group"] = pd.cut(
+        tif_raw_income["weighted_income"], bins=breaks, include_lowest=True,
+        labels=["Low-Income Districts","Middle-Income Districts","High-Income Districts"]
+    )
+    trend = (
+        tif_raw_income.groupby(["Report Year","income_group"])["Total Expenditure"]
+        .sum().reset_index()
+        .rename(columns={"Total Expenditure":"expenditure"})
+    )
+    return tif_raw, tif_full, comm, joined, trend
 
-tif_raw, tif_full, comm, joined = load_all()
+tif_raw, tif_full, comm, joined, trend = load_all()
 
 # Income legend values
 _, income_bins = pd.qcut(comm["weighted_income"].dropna(), q=5, retbins=True)
@@ -105,50 +131,81 @@ selected_year = st.sidebar.select_slider("Reporting Year", options=years, value=
 # Shared: filter TIF to selected year
 tif_year = (
     tif_raw[tif_raw["Report Year"] == selected_year]
-    .groupby("TIF District", as_index=False)
+    .groupby("tif_id", as_index=False)
     .agg(expenditures=("Total Expenditure", "sum"))
 )
-tif_income_lookup = joined[["TIF District", "weighted_income", "Community Area"]].drop_duplicates("TIF District")
+tif_income_lookup = joined[["tif_id", "weighted_income", "Community Area"]].drop_duplicates("tif_id")
 
 # ── Tabs ───────────────────────────────────────────────────────────────────────
-tab1, tab2, tab3, tab4 = st.tabs([
-    "Income Map",
-    "TIF Expenditure Map",
-    "TIF Expenditure by Income Quintile",
+tab1, tab2, tab3, tab4, tab5 = st.tabs([
+    "Map",
+    "Expenditure by Quintile",
     "Income vs. TIF Spending",
+    "Normalised: Spending per $ Increment",
+    "Spending Trends Over Time",
 ])
 
 # ══════════════════════════════════════════════════════════════════════════════
-# TAB 1 — Income Map: TIF districts filled by community income
+# TAB 1 — Map (toggle: expenditure fill or income fill)
 # ══════════════════════════════════════════════════════════════════════════════
 with tab1:
-    st.markdown(
-        "Each polygon is one **TIF district**, filled by the **household income** "
-        "of its surrounding community area. Darker blue = wealthier neighbourhood. "
-        "Hover for details."
+    map_mode = st.radio(
+        "Color districts by:",
+        ["Annual Expenditure", "Community Income", "Normalised Spending (Exp ÷ Increment)"],
+        horizontal=True,
     )
 
-    tif_map1 = tif_full.merge(tif_year, on="TIF District", how="left")
-    tif_map1 = tif_map1.merge(tif_income_lookup, on="TIF District", how="left")
+    tif_map1 = tif_full.merge(tif_year, on="tif_id", how="left")
+    tif_map1 = tif_map1.merge(tif_income_lookup, on="tif_id", how="left")
+    # exp_per_increment already in tif_full from load_all
+
     inc_min, inc_max = income_bins[0], income_bins[5]
+    exp_vals = tif_map1["expenditures"].dropna()
+    exp_min = exp_vals.quantile(0.05) if len(exp_vals) > 0 else 0
+    exp_max = exp_vals.quantile(0.95) if len(exp_vals) > 0 else 1
 
     m1 = folium.Map(location=[41.83, -87.68], zoom_start=11, tiles="CartoDB positron")
 
-    def style_income(feature):
-        inc = feature["properties"].get("weighted_income")
-        try:
-            fill = val_to_hex(np.clip(float(inc), inc_min, inc_max), inc_min, inc_max, "Blues")
-            return {"fillColor": fill, "fillOpacity": 0.8, "color": "white", "weight": 0.5}
-        except (TypeError, ValueError):
-            return {"fillColor": "#dddddd", "fillOpacity": 0.4, "color": "white", "weight": 0.5}
+    if map_mode == "Annual Expenditure":
+        def style_map(feature):
+            val = feature["properties"].get("expenditures")
+            try:
+                val = float(val)
+                if np.isnan(val): raise ValueError
+                fill = val_to_hex(np.clip(val, exp_min, exp_max), exp_min, exp_max, "YlOrRd")
+                return {"fillColor": fill, "fillOpacity": 0.85, "color": "#555", "weight": 0.4}
+            except (TypeError, ValueError):
+                return {"fillColor": "#dddddd", "fillOpacity": 0.3, "color": "#aaa", "weight": 0.4}
+    elif map_mode == "Community Income":
+        def style_map(feature):
+            inc = feature["properties"].get("weighted_income")
+            try:
+                fill = val_to_hex(np.clip(float(inc), inc_min, inc_max), inc_min, inc_max, "Blues")
+                return {"fillColor": fill, "fillOpacity": 0.8, "color": "white", "weight": 0.4}
+            except (TypeError, ValueError):
+                return {"fillColor": "#dddddd", "fillOpacity": 0.4, "color": "white", "weight": 0.4}
+    else:
+        # Normalised spending
+        norm_vals = tif_map1["exp_per_increment"].dropna()
+        norm_min = norm_vals.quantile(0.05) if len(norm_vals) > 0 else 0
+        norm_max = min(norm_vals.quantile(0.95), 10) if len(norm_vals) > 0 else 2
+        def style_map(feature):
+            val = feature["properties"].get("exp_per_increment")
+            try:
+                val = float(val)
+                if np.isnan(val): raise ValueError
+                fill = val_to_hex(np.clip(val, norm_min, norm_max), norm_min, norm_max, "PuRd")
+                return {"fillColor": fill, "fillOpacity": 0.85, "color": "#555", "weight": 0.4}
+            except (TypeError, ValueError):
+                return {"fillColor": "#dddddd", "fillOpacity": 0.3, "color": "#aaa", "weight": 0.4}
 
     folium.GeoJson(
-        tif_map1[["TIF District", "Community Area", "weighted_income", "expenditures", "geometry"]].__geo_interface__,
-        style_function=style_income,
-        highlight_function=lambda x: {"weight": 2, "color": "#000", "fillOpacity": 0.95},
+        tif_map1[["TIF District", "Community Area", "weighted_income", "expenditures", "exp_per_increment", "geometry"]].__geo_interface__,
+        style_function=style_map,
+        highlight_function=lambda x: {"weight": 4, "color": "#000", "fillOpacity": 0.95},
         tooltip=folium.GeoJsonTooltip(
-            fields=["TIF District", "Community Area", "weighted_income", "expenditures"],
-            aliases=["TIF District", "Community Area", f"Community Income ($)", f"Expenditures ({selected_year}) $"],
+            fields=["TIF District", "Community Area", "weighted_income", "expenditures", "exp_per_increment"],
+            aliases=["TIF District", "Community Area", "Community Income ($)", f"Expenditures ({selected_year}) $", "Exp ÷ Increment"],
             localize=True,
         ),
     ).add_to(m1)
@@ -158,88 +215,50 @@ with tab1:
         st_folium(m1, width=900, height=620, key="map1")
     with col2:
         st.subheader(f"Top 10 Districts ({selected_year})")
-        top10 = (tif_year.nlargest(10, "expenditures")[["TIF District", "expenditures"]]
+        top10 = (tif_year.nlargest(10, "expenditures").merge(tif_full[["tif_id","TIF District"]].drop_duplicates(), on="tif_id", how="left")[["TIF District", "expenditures"]]
                  .rename(columns={"expenditures": "Expenditures ($)"})
                  .assign(**{"Expenditures ($)": lambda df: df["Expenditures ($)"].map("${:,.0f}".format)})
                  .reset_index(drop=True))
         st.dataframe(top10, hide_index=True, use_container_width=True)
-        st.markdown("**Income Legend**")
-        for color, label in zip(blues_legend, income_bin_labels):
-            st.markdown(f'<span style="background:{color};padding:2px 12px;border-radius:3px;margin-right:6px;">&nbsp;</span>{label}', unsafe_allow_html=True)
 
-# ══════════════════════════════════════════════════════════════════════════════
-# TAB 2 — Expenditure Map: TIF districts filled by annual spending
-# ══════════════════════════════════════════════════════════════════════════════
-with tab2:
-    st.markdown(
-        "Each polygon is one **TIF district**, filled by its **annual expenditure** "
-        "for the selected year. Darker orange/red = higher spending. "
-        "Hover for details."
-    )
-
-    tif_map2 = tif_full.merge(tif_year, on="TIF District", how="left")
-    exp_vals = tif_map2["expenditures"].dropna()
-    exp_min = exp_vals.quantile(0.05) if len(exp_vals) > 0 else 0
-    exp_max = exp_vals.quantile(0.95) if len(exp_vals) > 0 else 1
-
-    m2 = folium.Map(location=[41.83, -87.68], zoom_start=11, tiles="CartoDB positron")
-
-    def style_expenditure(feature):
-        val = feature["properties"].get("expenditures")
-        try:
-            val = float(val)
-            if np.isnan(val): raise ValueError
-            fill = val_to_hex(np.clip(val, exp_min, exp_max), exp_min, exp_max, "YlOrRd")
-            return {"fillColor": fill, "fillOpacity": 0.85, "color": "#555", "weight": 0.4}
-        except (TypeError, ValueError):
-            return {"fillColor": "#dddddd", "fillOpacity": 0.3, "color": "#aaa", "weight": 0.4}
-
-    folium.GeoJson(
-        tif_map2[["TIF District", "expenditures", "geometry"]].__geo_interface__,
-        style_function=style_expenditure,
-        highlight_function=lambda x: {"weight": 2, "color": "#000", "fillOpacity": 0.95},
-        tooltip=folium.GeoJsonTooltip(
-            fields=["TIF District", "expenditures"],
-            aliases=["TIF District", f"Expenditures ({selected_year}) $"],
-            localize=True,
-        ),
-    ).add_to(m2)
-
-    col1b, col2b = st.columns([3, 1])
-    with col1b:
-        st_folium(m2, width=900, height=620, key="map2")
-    with col2b:
-        st.subheader(f"Top 10 Districts ({selected_year})")
-        top10b = (tif_year.nlargest(10, "expenditures")[["TIF District", "expenditures"]]
-                  .rename(columns={"expenditures": "Expenditures ($)"})
-                  .assign(**{"Expenditures ($)": lambda df: df["Expenditures ($)"].map("${:,.0f}".format)})
-                  .reset_index(drop=True))
-        st.dataframe(top10b, hide_index=True, use_container_width=True)
-        st.markdown("**Expenditure Legend**")
-        for frac, label in [(0.1, "Low"), (0.35, "Low-Mid"), (0.6, "Mid-High"), (0.85, "Highest")]:
-            color = val_to_hex(exp_min + (exp_max - exp_min) * frac, exp_min, exp_max, "YlOrRd")
-            st.markdown(f'<span style="background:{color};padding:2px 12px;border-radius:3px;margin-right:6px;">&nbsp;</span>{label}', unsafe_allow_html=True)
+        if map_mode == "Annual Expenditure":
+            st.markdown("**Expenditure Legend**")
+            exp_breaks = np.linspace(exp_min, exp_max, 6)
+            exp_bin_labels = [f"${exp_breaks[i]/1e6:.1f}M – ${exp_breaks[i+1]/1e6:.1f}M" for i in range(5)]
+            exp_colors = [val_to_hex((exp_breaks[i]+exp_breaks[i+1])/2, exp_min, exp_max, "YlOrRd") for i in range(5)]
+            for color, label in zip(exp_colors, exp_bin_labels):
+                st.markdown(f'<span style="background:{color};padding:2px 12px;border-radius:3px;margin-right:6px;">&nbsp;</span>{label}', unsafe_allow_html=True)
+    
+        elif map_mode == "Community Income":
+            st.markdown("**Income Legend**")
+            for color, label in zip(blues_legend, income_bin_labels):
+                st.markdown(f'<span style="background:{color};padding:2px 12px;border-radius:3px;margin-right:6px;">&nbsp;</span>{label}', unsafe_allow_html=True)
+        else:
+            st.markdown("**Normalised Spending Legend**")
+            nr_breaks = np.linspace(norm_min, norm_max, 6)
+            for i in range(5):
+                color = val_to_hex((nr_breaks[i]+nr_breaks[i+1])/2, norm_min, norm_max, "PuRd")
+                label = f"{nr_breaks[i]:.2f} – {nr_breaks[i+1]:.2f}"
+                st.markdown(f'<span style="background:{color};padding:2px 12px;border-radius:3px;margin-right:6px;">&nbsp;</span>{label}', unsafe_allow_html=True)
+            st.caption("Exp ÷ Increment. Values > 10 shown as max colour.")
 
 # ══════════════════════════════════════════════════════════════════════════════
 # TAB 3 — Quintile Box Plot
 # ══════════════════════════════════════════════════════════════════════════════
-with tab3:
+with tab2:
     st.markdown(
         "Each TIF district is assigned to the community area its centroid falls in. "
-        "Community areas are ranked into **five income quintiles** (Q1 = lowest, Q5 = highest). "
-        "Values below 1st and above 99th percentile are trimmed."
+        "Community areas are ranked into five income quintiles (Q1 = lowest, Q5 = highest). "
     )
 
-    p1  = joined["cumulative_expenditures"].quantile(0.01)
-    p99 = joined["cumulative_expenditures"].quantile(0.99)
-    joined_trim = joined[joined["cumulative_expenditures"].between(p1, p99)].copy()
-    joined_trim["quintile"] = pd.qcut(
-        joined_trim["weighted_income"], q=5,
-        labels=["Q1\n(Lowest)", "Q2", "Q3", "Q4", "Q5\n(Highest)"]
+    joined_plot = joined.copy()
+    joined_plot["quintile"] = pd.qcut(
+        joined_plot["weighted_income"], q=5,
+        labels=["Q1", "Q2", "Q3", "Q4", "Q5"]
     )
 
-    quintile_order = ["Q1\n(Lowest)", "Q2", "Q3", "Q4", "Q5\n(Highest)"]
-    groups = [joined_trim.loc[joined_trim["quintile"] == q, "cumulative_expenditures"].dropna() / 1e6
+    quintile_order = ["Q1", "Q2", "Q3", "Q4", "Q5"]
+    groups = [joined_plot.loc[joined_plot["quintile"] == q, "cumulative_expenditures"].dropna() / 1e6
               for q in quintile_order]
 
     fig3, ax3 = plt.subplots(figsize=(8, 5))
@@ -255,15 +274,15 @@ with tab3:
 
     ax3.set_xlabel("Community Area Income Quintile", fontsize=11)
     ax3.set_ylabel("Cumulative TIF Expenditures ($ millions)", fontsize=11)
-    ax3.set_title("TIF Expenditures Are Highest in the Wealthiest Neighbourhoods", fontsize=13, fontweight="bold")
+    ax3.set_title("Cumulative TIF Expenditures by Community Income Quintile", fontsize=13, fontweight="bold")
     ax3.yaxis.grid(True, linestyle="--", alpha=0.5)
     ax3.set_axisbelow(True)
     plt.tight_layout()
     st.pyplot(fig3)
-    st.caption("Values below 1st and above 99th percentile trimmed.")
+    
 
     st.subheader("Summary Statistics by Quintile")
-    summary = (joined_trim.groupby("quintile", observed=True)["cumulative_expenditures"]
+    summary = (joined_plot.groupby("quintile", observed=True)["cumulative_expenditures"]
                .describe(percentiles=[0.25, 0.5, 0.75])[["count", "mean", "50%", "25%", "75%"]]
                .rename(columns={"count": "N", "mean": "Mean ($M)", "50%": "Median ($M)", "25%": "Q25 ($M)", "75%": "Q75 ($M)"}))
     summary.index = quintile_order
@@ -276,40 +295,181 @@ with tab3:
 # ══════════════════════════════════════════════════════════════════════════════
 # TAB 4 — Scatter: Income vs. TIF Spending
 # ══════════════════════════════════════════════════════════════════════════════
-with tab4:
+with tab3:
     st.markdown(
-        "Each point is one **TIF district**, plotted by its community area income (x) "
+        "Each point is one TIF district, plotted by its community area income (x) "
         "against cumulative TIF expenditure (y). Top 1% trimmed."
     )
 
-    p99s = joined["cumulative_expenditures"].quantile(0.99)
-    scatter_data = joined[joined["cumulative_expenditures"] <= p99s].copy()
+    scatter_data = joined.copy()
     scatter_data["exp_m"]    = scatter_data["cumulative_expenditures"] / 1e6
     scatter_data["income_k"] = scatter_data["weighted_income"] / 1000
 
     slope, intercept, r, p, _ = stats.linregress(scatter_data["income_k"], scatter_data["exp_m"])
+    r2 = r ** 2
     x_line = np.linspace(scatter_data["income_k"].min(), scatter_data["income_k"].max(), 200)
     y_line = intercept + slope * x_line
 
     fig4, ax4 = plt.subplots(figsize=(8, 5))
     ax4.scatter(scatter_data["income_k"], scatter_data["exp_m"],
                 alpha=0.55, s=30, color="steelblue", edgecolors="white", linewidths=0.4)
-    ax4.plot(x_line, y_line, color="crimson", linewidth=2, label=f"Trend line  (r = {r:.2f}, p = {p:.3f})")
+    ax4.plot(x_line, y_line, color="crimson", linewidth=2,
+             label=f"Trend line  (r = {r:.2f}, R² = {r2:.2f}, p = {p:.3f})")
     ax4.set_xlabel("Community Area Weighted Mean Income ($000s)", fontsize=11)
     ax4.set_ylabel("Cumulative TIF Expenditures ($ millions)", fontsize=11)
-    ax4.set_title("Wealthier Neighbourhoods Attract More TIF Spending", fontsize=13, fontweight="bold")
+    ax4.set_title("Association Between Community Income and Cumulative TIF Expenditures", fontsize=13, fontweight="bold")
     ax4.legend(fontsize=10)
     ax4.yaxis.grid(True, linestyle="--", alpha=0.4)
     ax4.set_axisbelow(True)
     plt.tight_layout()
     st.pyplot(fig4)
-    st.caption(f"Top 1% of expenditure values excluded (>{p99s/1e6:.0f}M). n = {len(scatter_data)} TIF districts.")
 
     col_a, col_b, col_c, col_d = st.columns(4)
     col_a.metric("Correlation (r)", f"{r:.2f}")
-    col_b.metric("p-value", f"{p:.3f}")
-    col_c.metric("TIF Districts (trimmed)", len(scatter_data))
-    col_d.metric("R²", f"{r**2:.2f}")
+    col_b.metric("R²", f"{r2:.2f}")
+    col_c.metric("p-value", f"{p:.3f}")
+    col_d.metric("TIF Districts", len(scatter_data))
+
+# ══════════════════════════════════════════════════════════════════════════════
+# TAB 4 — Normalised: expenditure per $1 of tax increment
+# ══════════════════════════════════════════════════════════════════════════════
+with tab4:
+    st.markdown(
+        "A limitation of raw expenditure figures is that wealthier districts "
+        "generate more property tax increment to begin with. This tab normalizes "
+        "by dividing each district's cumulative expenditure by its cumulative "
+        "tax increment — giving a measure of spending effort rather than "
+        "raw dollars. A value of 1.0 means the district spent exactly as much "
+        "as it generated; values above 1.0 indicate spending beyond increment."
+    )
+
+    norm_data = joined.dropna(subset=["exp_per_increment", "weighted_income"]).copy()
+    # Drop extreme outliers (ratio > 10 likely data issues)
+    norm_data = norm_data[norm_data["exp_per_increment"] < 10]
+    norm_data["income_k"] = norm_data["weighted_income"] / 1000
+
+    col_left, col_right = st.columns(2)
+
+    # ── Left: scatter ──────────────────────────────────────────────────────────
+    with col_left:
+        st.subheader("Income vs. Normalized Spending")
+        slope_n, intercept_n, r_n, p_n, _ = stats.linregress(
+            norm_data["income_k"], norm_data["exp_per_increment"]
+        )
+        r2_n = r_n ** 2
+        x_n = np.linspace(norm_data["income_k"].min(), norm_data["income_k"].max(), 200)
+        y_n = intercept_n + slope_n * x_n
+
+        fig_n, ax_n = plt.subplots(figsize=(5.5, 4.5))
+        ax_n.scatter(norm_data["income_k"], norm_data["exp_per_increment"],
+                     alpha=0.55, s=28, color="steelblue", edgecolors="white", linewidths=0.4)
+        ax_n.plot(x_n, y_n, color="crimson", linewidth=2,
+                  label=f"r = {r_n:.2f}, R² = {r2_n:.2f}, p = {p_n:.3f}")
+        ax_n.axhline(1.0, color="grey", linestyle="--", linewidth=1, alpha=0.6, label="Ratio = 1.0")
+        ax_n.set_xlabel("Community Area Income ($000s)", fontsize=10)
+        ax_n.set_ylabel("Expenditure / Tax Increment", fontsize=10)
+        ax_n.set_title("Normalized TIF Spending by Community Income",
+                       fontsize=11, fontweight="bold")
+        ax_n.legend(fontsize=9)
+        ax_n.yaxis.grid(True, linestyle="--", alpha=0.4)
+        ax_n.set_axisbelow(True)
+        plt.tight_layout()
+        st.pyplot(fig_n)
+
+        ca, cb, cc = st.columns(3)
+        ca.metric("r", f"{r_n:.2f}")
+        cb.metric("R²", f"{r2_n:.2f}")
+        cc.metric("p-value", f"{p_n:.3f}")
+
+    # ── Right: quintile boxplot ────────────────────────────────────────────────
+    with col_right:
+        st.subheader("Normalized Spending by Income Quintile")
+        norm_data["quintile"] = pd.qcut(
+            norm_data["weighted_income"], q=5,
+            labels=["Q1\n(Lowest)", "Q2", "Q3", "Q4", "Q5\n(Highest)"]
+        )
+        quintile_order = ["Q1\n(Lowest)", "Q2", "Q3", "Q4", "Q5\n(Highest)"]
+        groups_n = [
+            norm_data.loc[norm_data["quintile"] == q, "exp_per_increment"].dropna()
+            for q in quintile_order
+        ]
+
+        fig_nb, ax_nb = plt.subplots(figsize=(5.5, 4.5))
+        bp_n = ax_nb.boxplot(
+            groups_n, labels=quintile_order, patch_artist=True,
+            medianprops={"color": "black", "linewidth": 1.5},
+            flierprops={"marker": "o", "markersize": 3, "markerfacecolor": "grey", "alpha": 0.5},
+            whiskerprops={"linewidth": 1}, capprops={"linewidth": 1},
+        )
+        blues = plt.cm.Blues(np.linspace(0.3, 0.85, 5))
+        for patch, color in zip(bp_n["boxes"], blues):
+            patch.set_facecolor(color)
+        for i, grp in enumerate(groups_n, start=1):
+            ax_nb.scatter(np.random.normal(i, 0.07, size=len(grp)), grp,
+                          alpha=0.4, s=15, color="steelblue", zorder=3)
+        ax_nb.axhline(1.0, color="grey", linestyle="--", linewidth=1, alpha=0.6)
+        ax_nb.set_xlabel("Income Quintile", fontsize=10)
+        ax_nb.set_ylabel("Expenditure / Tax Increment", fontsize=10)
+        ax_nb.set_title("Normalized Spending by Quintile",
+                        fontsize=11, fontweight="bold")
+        ax_nb.yaxis.grid(True, linestyle="--", alpha=0.4)
+        ax_nb.set_axisbelow(True)
+        plt.tight_layout()
+        st.pyplot(fig_nb)
+
+    st.caption(
+        "Districts with expenditure/increment ratio > 10 excluded as outliers. Uses last reported cumulative increment. "
+        f"n = {len(norm_data)} districts."
+    )
+
+# ══════════════════════════════════════════════════════════════════════════════
+# TAB 5 — Spending Trends Over Time
+# ══════════════════════════════════════════════════════════════════════════════
+with tab5:
+    st.markdown(
+        "TIF districts grouped into three income tertiles based on their surrounding "
+        "community area income. Each line shows the total annual TIF expenditure for that group. "
+        "Data covers 2017–2024, the full range available in the annual report."
+    )
+
+    pivot = trend.pivot(index="Report Year", columns="income_group", values="expenditure")
+    years = sorted(pivot.index.astype(int))
+
+    group_colors = {
+        "Low-Income Districts":    "#2166ac",
+        "Middle-Income Districts": "#78c679",
+        "High-Income Districts":   "#d73027",
+    }
+
+    fig_t, ax_t = plt.subplots(figsize=(9, 5))
+    for grp in ["High-Income Districts","Middle-Income Districts","Low-Income Districts"]:
+        if grp in pivot.columns:
+            ax_t.plot(pivot.index.astype(int), pivot[grp]/1e6,
+                      label=grp, color=group_colors[grp],
+                      linewidth=2.2, marker="o", markersize=5)
+
+    ax_t.set_xlabel("Year", fontsize=11)
+    ax_t.set_ylabel("Total Annual TIF Expenditures ($ millions)", fontsize=11)
+    ax_t.set_title(
+        "TIF Spending by Community Income Group (2017–2024)",
+        fontsize=12, fontweight="bold"
+    )
+    ax_t.legend(fontsize=10, framealpha=0.9)
+    import matplotlib.ticker as mticker
+    ax_t.yaxis.set_major_formatter(mticker.FuncFormatter(lambda x, _: f"${x:,.0f}M"))
+    ax_t.yaxis.grid(True, linestyle="--", alpha=0.4)
+    ax_t.set_axisbelow(True)
+    ax_t.set_xticks(years)
+    ax_t.set_xlim(min(years)-0.5, max(years)+0.5)
+    plt.tight_layout()
+    st.pyplot(fig_t)
+
+    # Summary table
+    st.subheader("Annual Expenditure by Group ($M)")
+    tbl = (pivot / 1e6).round(1)
+    tbl.index = tbl.index.astype(int)
+    tbl.columns.name = None
+    st.dataframe(tbl.style.format("${:.1f}M"), use_container_width=True)
 
 st.markdown("---")
 st.caption("Data: Chicago Data Portal — TIF Annual Reports, TIF District Boundaries, Community Area Boundaries, ACS 5-Year Data by Community Area.")
