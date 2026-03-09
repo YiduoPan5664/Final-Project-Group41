@@ -209,6 +209,4 @@ __marimo__/
 # Project-specific
 data/derived-data/
 figures/
-*.html
-*.pdf
 .DS_Store
